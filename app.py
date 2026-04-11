@@ -187,13 +187,10 @@ def show_movie(movie):
 st.markdown("""
 <style>
 
-body{
-background:#0e1117;
-color:white;
-}
-
-.stApp{
-background:#0e1117;
+/* Keep styling theme-aware so Streamlit handles both Light and Dark modes */
+.stApp {
+    background-color: var(--background-color);
+    color: var(--text-color);
 }
 
 img{
@@ -202,7 +199,7 @@ transition: transform 0.3s ease;
 }
 
 img:hover{
-transform: scale(1.15);
+transform: scale(1.03);
 }
 
 </style>
