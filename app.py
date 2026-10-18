@@ -1,5 +1,8 @@
 import streamlit as st
-import pickle
+import os
+from pathlib import Path
+from recommender import (load_catalog, content_model, content_recommendations,
+                         collaborative_model, collaborative_recommendations)
 import pandas as pd
 import requests
 import re
@@ -7,10 +10,30 @@ import re
 # -----------------------------
 # Load models
 # -----------------------------
-movies = pickle.load(open("movies.pkl", "rb"))
-similarity = pickle.load(open("similarity.pkl", "rb"))
+st.set_page_config(page_title="NextFlix · Movie discovery", page_icon="🎬", layout="wide")
 
-TMDB_KEY = st.secrets["TMDB_API_KEY"]
+@st.cache_resource
+def load_models():
+    catalog = load_catalog()
+    return catalog, content_model(catalog)
+
+@st.cache_resource
+def load_collaborative():
+    return collaborative_model()
+
+movies, content_matrix = load_models()
+
+def api_key():
+    key = os.environ.get("TMDB_API_KEY", "")
+    if not key:
+        try:
+            key = st.secrets.get("TMDB_API_KEY", "")
+        except (FileNotFoundError, st.errors.StreamlitSecretNotFoundError):
+            pass
+    return key
+
+TMDB_KEY = api_key()
+PLACEHOLDER = str(Path(__file__).resolve().parent / "assets" / "poster.svg")
 
 GENRE_KEYWORDS = {
     "action": 28,
@@ -44,7 +67,11 @@ MOOD_KEYWORDS = {
 }
 
 
+@st.cache_data(ttl=900, max_entries=1024, show_spinner=False)
 def tmdb_get(path, params=None):
+
+    if not TMDB_KEY:
+        return {}
 
     query_params = params.copy() if params else {}
     query_params["api_key"] = TMDB_KEY
@@ -54,11 +81,11 @@ def tmdb_get(path, params=None):
         response = requests.get(
             f"https://api.themoviedb.org/3/{path}",
             params=query_params,
-            timeout=10
+            timeout=5
         )
         response.raise_for_status()
         return response.json()
-    except requests.RequestException:
+    except (requests.RequestException, ValueError):
         return {}
 
 
@@ -69,19 +96,21 @@ def poster_from_path(poster_path):
 
     return None
 
-@st.cache_data
+@st.cache_data(ttl=900, max_entries=1024)
 # -----------------------------
 # Poster
 # -----------------------------
 def fetch_poster(tmdb):
 
-    data = tmdb_get(f"movie/{tmdb}")
+    if pd.isna(tmdb):
+        return PLACEHOLDER
+    data = tmdb_get(f"movie/{int(tmdb)}")
     poster = poster_from_path(data.get("poster_path"))
 
     if poster:
         return poster
 
-    return "https://via.placeholder.com/500x750?text=No+Poster"
+    return PLACEHOLDER
 
 
 # -----------------------------
@@ -89,7 +118,7 @@ def fetch_poster(tmdb):
 # -----------------------------
 def movie_details(tmdb):
 
-    data = tmdb_get(f"movie/{tmdb}")
+    data = tmdb_get(f"movie/{int(tmdb)}") if not pd.isna(tmdb) else {}
 
     rating=data.get("vote_average","N/A")
     release=data.get("release_date","")
@@ -103,11 +132,11 @@ def movie_details(tmdb):
 # -----------------------------
 def trailer(tmdb):
 
-    data = tmdb_get(f"movie/{tmdb}/videos")
+    data = tmdb_get(f"movie/{int(tmdb)}/videos") if not pd.isna(tmdb) else {}
 
     for v in data.get("results",[]):
 
-        if v["type"]=="Trailer" and v["site"]=="YouTube":
+        if v.get("type")=="Trailer" and v.get("site")=="YouTube" and v.get("key"):
 
             return f"https://www.youtube.com/watch?v={v['key']}"
 
@@ -144,28 +173,12 @@ def trending():
 # -----------------------------
 def recommend(movie):
 
-    idx=movies[movies["title"]==movie].index[0]
-    distances=similarity[idx]
+    return catalog_cards(content_recommendations(movies, content_matrix, movie))
 
-    movie_list=sorted(
-        list(enumerate(distances)),
-        reverse=True,
-        key=lambda x:x[1]
-    )[1:6]
 
-    results=[]
-
-    for i in movie_list:
-
-        row=movies.iloc[i[0]]
-
-        results.append({
-            "title":row["title"],
-            "tmdb":row["tmdbId"],
-            "poster":fetch_poster(row["tmdbId"])
-        })
-
-    return results
+def catalog_cards(rows):
+    return [{"title": row["title"], "tmdb": row["tmdbId"],
+             "poster": fetch_poster(row["tmdbId"])} for _, row in rows.iterrows()]
 
 
 # -----------------------------
@@ -209,16 +222,16 @@ def extract_actor_name(query):
 
 def detect_genre_id(query):
 
-    lowered = query.lower()
+    lowered = normalize_title(query)
 
     for keyword, genre_id in sorted(GENRE_KEYWORDS.items(), key=lambda x: len(x[0]), reverse=True):
 
-        if keyword in lowered:
+        if re.search(r"\b" + re.escape(keyword) + r"\b", lowered):
             return genre_id
 
     for keyword, genre_id in sorted(MOOD_KEYWORDS.items(), key=lambda x: len(x[0]), reverse=True):
 
-        if keyword in lowered:
+        if re.search(r"\b" + re.escape(keyword) + r"\b", lowered):
             return genre_id
 
     return None
@@ -330,7 +343,15 @@ def assistant_movie_recommendations(query, limit=5):
     if popular_movies:
         return popular_movies[:limit], "Here are some popular movies you can try:"
 
-    return [], "I could not find movie recommendations right now."
+    genre_names = {878: "Sci-Fi", 10751: "Children"}
+    if genre_id:
+        name = genre_names.get(genre_id, next((k.title() for k, v in GENRE_KEYWORDS.items() if v == genre_id), ""))
+        rows = movies[movies["genres"].str.split("|").apply(lambda values: name in values)]
+    else:
+        rows = movies[movies["title"].str.contains(query, case=False, regex=False)]
+    if not rows.empty:
+        return catalog_cards(rows.head(limit)), "Here are matches from the local movie catalog:"
+    return [], "No matches found. Try a movie title or a genre such as comedy or science fiction."
 
 
 def build_clickable_assistant_movies(recommended_movies, limit=5):
@@ -340,12 +361,6 @@ def build_clickable_assistant_movies(recommended_movies, limit=5):
     for item in recommended_movies:
 
         poster = item.get("poster") or fetch_poster(item["tmdb"])
-
-        if not poster or "via.placeholder.com" in poster:
-            continue
-
-        if not trailer(item["tmdb"]):
-            continue
 
         clickable.append({
             "title": item["title"],
@@ -384,7 +399,7 @@ def render_movie_banner_grid(movies_list, key_prefix, max_columns):
 
         with cols[i]:
 
-            st.image(movie["poster"], use_container_width=True)
+            st.image(movie.get("poster") or PLACEHOLDER, width="stretch")
 
             if st.button(movie["title"], key=f"{key_prefix}{i}"):
 
@@ -439,9 +454,15 @@ def show_movie(movie):
         st.write("### Overview")
         st.write(overview)
 
+    if not overview:
+        st.info("Movie details are temporarily unavailable. Please try again later.")
+
     if vid:
         st.write("### 🎬 Trailer")
         st.video(vid)
+
+    else:
+        st.caption("No trailer available for this movie.")
 
     if st.button("⬅ Back to Home"):
         st.session_state.movie_page = None
@@ -488,6 +509,8 @@ if st.session_state.movie_page:
 st.title("🎬 NextFlix")
 
 st.write("Discover your next favorite movie")
+if not TMDB_KEY:
+    st.info("Browsing the local catalog. Add a TMDB API key to enable posters, trending movies, actor search, and trailers.")
 
 
 # -----------------------------
@@ -496,13 +519,13 @@ st.write("Discover your next favorite movie")
 genres=set()
 
 for g in movies["genres"]:
-    for x in g.split():
+    for x in g.split("|"):
         genres.add(x)
 
 genre=st.selectbox("Filter by Genre",["All"]+sorted(list(genres)))
 
 if genre!="All":
-    filtered_movies=movies[movies["genres"].str.contains(genre)]
+    filtered_movies=movies[movies["genres"].str.split("|").apply(lambda values: genre in values)]
 else:
     filtered_movies=movies
 
@@ -514,7 +537,10 @@ st.subheader("🔥 Trending")
 
 trend=trending()
 
-render_movie_banner_grid(trend,"t",6)
+if trend:
+    render_movie_banner_grid(trend,"t",6)
+else:
+    st.caption("Trending movies are temporarily unavailable. Explore the catalog below.")
 
 
 st.write("---")
@@ -527,7 +553,7 @@ st.write("---")
 # -----------------------------
 movie=st.selectbox("Search Movie",filtered_movies["title"].values)
 
-if st.button("Recommend"):
+if st.button("Recommend", type="primary"):
     st.session_state.recommendations=recommend(movie)
 
 
@@ -545,9 +571,19 @@ st.write("---")
 
 
 # -----------------------------
-# AI chatbot
+# Movie assistant
 # -----------------------------
+with st.expander("Recommendations from similar viewers"):
+    st.caption("Explore recommendations for an anonymous MovieLens sample viewer, based on ratings from similar viewers.")
+    viewer = st.selectbox("Sample viewer", list(range(1, 611)))
+    if st.button("Find viewer recommendations"):
+        st.session_state["viewer_recommendations"] = catalog_cards(
+            collaborative_recommendations(movies, load_collaborative(), viewer))
+    if st.session_state.get("viewer_recommendations"):
+        render_movie_banner_grid(st.session_state["viewer_recommendations"], "viewer", 5)
+
 st.subheader("🤖 Movie Assistant")
+st.caption("Try ‘comedy’, ‘mind-bending movies’, or ‘movies with Tom Hanks’. Suggestions use movie search and genre matching.")
 
 query=st.chat_input("Ask for movie suggestions")
 
@@ -578,7 +614,7 @@ if st.session_state.assistant_text_response:
 
 if st.session_state.assistant_clickable_movies:
 
-    st.write("### 🎥 Watch trailers")
+    st.write("### 🎥 Explore movies")
 
     render_movie_banner_grid(
         st.session_state.assistant_clickable_movies,
