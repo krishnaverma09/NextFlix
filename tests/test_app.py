@@ -41,10 +41,13 @@ class AppTestCase(unittest.TestCase):
         # Deterministic API outage also verifies the local fallback paths.
         self.network = patch('requests.get', side_effect=__import__('requests').ConnectionError)
         self.network.start()
+        self.groq_network = patch("requests.post", side_effect=__import__("requests").ConnectionError)
+        self.groq_network.start()
         self.app = AppTest.from_file('app.py', default_timeout=30).run()
 
     def tearDown(self):
         self.network.stop()
+        self.groq_network.stop()
 
     def test_home_filter_recommend_detail_and_back(self):
         app = self.app
@@ -73,6 +76,25 @@ class AppTestCase(unittest.TestCase):
         next(b for b in app.button if b.label == 'Find viewer recommendations').click().run()
         self.assertEqual(len(app.session_state['viewer_recommendations']), 5)
         self.assertFalse(app.exception)
+
+    def test_ai_chat_history_and_clear(self):
+        from unittest.mock import Mock
+        import json
+        response = Mock()
+        response.json.return_value = {'choices': [{'message': {'content': json.dumps(
+            {'reply': 'Arrival is thoughtful science fiction.', 'titles': ['Arrival']})}}]}
+        with patch('movie_assistant.requests.post', return_value=response) as post:
+            with patch.dict(os.environ, {'GROQ_API_KEY': 'test-key'}):
+                app = AppTest.from_file('app.py', default_timeout=30).run()
+                app.chat_input[0].set_value('Suggest science fiction').run()
+                self.assertFalse(app.exception)
+                self.assertEqual(len(app.session_state.conversation), 2)
+                app.chat_input[0].set_value('Which is less scary?').run()
+                self.assertEqual(len(app.session_state.conversation), 4)
+                self.assertEqual(len(post.call_args.kwargs['json']['messages']), 4)
+                next(b for b in app.button if b.label == 'Clear conversation').click().run()
+                self.assertEqual(app.session_state.conversation, [])
+                self.assertEqual(app.session_state.assistant_clickable_movies, [])
 
     def test_genre_word_boundaries(self):
         self.app.chat_input[0].set_value('information').run()

@@ -1,4 +1,5 @@
 import streamlit as st
+from movie_assistant import groq_response
 import os
 from pathlib import Path
 from recommender import (load_catalog, content_model, content_recommendations,
@@ -23,16 +24,17 @@ def load_collaborative():
 
 movies, content_matrix = load_models()
 
-def api_key():
-    key = os.environ.get("TMDB_API_KEY", "")
+def api_key(name="TMDB_API_KEY"):
+    key = os.environ.get(name, "")
     if not key:
         try:
-            key = st.secrets.get("TMDB_API_KEY", "")
+            key = st.secrets.get(name, "")
         except (FileNotFoundError, st.errors.StreamlitSecretNotFoundError):
             pass
     return key
 
 TMDB_KEY = api_key()
+GROQ_KEY = api_key("GROQ_API_KEY")
 PLACEHOLDER = str(Path(__file__).resolve().parent / "assets" / "poster.svg")
 
 GENRE_KEYWORDS = {
@@ -583,34 +585,55 @@ with st.expander("Recommendations from similar viewers"):
         render_movie_banner_grid(st.session_state["viewer_recommendations"], "viewer", 5)
 
 st.subheader("🤖 Movie Assistant")
-st.caption("Try ‘comedy’, ‘mind-bending movies’, or ‘movies with Tom Hanks’. Suggestions use movie search and genre matching.")
+st.caption("Ask for recommendations, compare movies, or follow up with your preferences.")
+if "conversation" not in st.session_state:
+    st.session_state.conversation = []
+if st.button("Clear conversation"):
+    st.session_state.conversation = []
+    st.session_state.assistant_clickable_movies = []
+    st.session_state.assistant_fallback_note = None
+if not GROQ_KEY:
+    st.caption("Movie search mode · Configure Groq to enable AI conversation.")
 
 query=st.chat_input("Ask for movie suggestions")
 
 if query:
 
     with st.spinner("Finding movies for you..."):
-        recommended_movies,header=assistant_movie_recommendations(query,limit=5)
-        clickable_movies=build_clickable_assistant_movies(recommended_movies,limit=5)
+        ai_result = groq_response(query, GROQ_KEY, st.session_state.conversation)
+        recommended_movies = []
+        if ai_result:
+            response_text = ai_result["reply"]
+            seen = set()
+            for title in ai_result["titles"]:
+                matches = fetch_movies_for_query(title, limit=1)
+                if not matches:
+                    rows = movies[movies["title"].str.contains(title, case=False, regex=False)]
+                    matches = catalog_cards(rows.head(1))
+                for item in matches:
+                    if item["title"] not in seen:
+                        recommended_movies.append(item)
+                        seen.add(item["title"])
+            st.session_state.assistant_fallback_note = None
+        else:
+            recommended_movies, header = assistant_movie_recommendations(query, limit=5)
+            response_text = build_assistant_text_response(header, recommended_movies)
+            st.session_state.assistant_fallback_note = (
+                "Groq is temporarily unavailable. Showing movie search results instead."
+                if GROQ_KEY else "Showing movie search results. AI conversation needs a Groq API key.")
+        st.session_state.assistant_clickable_movies = build_clickable_assistant_movies(recommended_movies)
+        st.session_state.conversation.extend([
+            {"role": "user", "content": query[:3000]},
+            {"role": "assistant", "content": response_text}])
+        st.session_state.conversation = st.session_state.conversation[-10:]
+        # Retain the latest response for integrations and regression checks.
+        st.session_state.assistant_text_response = response_text
 
-    st.session_state.assistant_query=query
-    st.session_state.assistant_text_response=build_assistant_text_response(header,recommended_movies)
+for message in st.session_state.conversation:
+    st.chat_message(message["role"]).write(message["content"])
 
-    st.session_state.assistant_clickable_movies=clickable_movies
-
-    if recommended_movies and not clickable_movies:
-        st.session_state.assistant_fallback_note=(
-            "Clickable movie banners are not available for this request, "
-            "so showing text recommendations instead."
-        )
-    else:
-        st.session_state.assistant_fallback_note=None
-
-if st.session_state.assistant_query:
-    st.chat_message("user").write(st.session_state.assistant_query)
-
-if st.session_state.assistant_text_response:
-    st.chat_message("assistant").write(st.session_state.assistant_text_response)
+if st.session_state.assistant_fallback_note:
+    st.info(st.session_state.assistant_fallback_note)
 
 if st.session_state.assistant_clickable_movies:
 
@@ -621,6 +644,3 @@ if st.session_state.assistant_clickable_movies:
         "ai",
         len(st.session_state.assistant_clickable_movies)
     )
-
-elif st.session_state.assistant_fallback_note:
-    st.info(st.session_state.assistant_fallback_note)
